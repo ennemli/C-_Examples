@@ -1,40 +1,96 @@
-#include <coroutine>
 #include <iostream>
+#include <coroutine>
+#include <future>
+#include <thread>
+#include <chrono>
 
-template <typename T> struct RObj {
-  struct promise_type {
-    T value_;
-    ~promise_type() { std::cout << "promise_type destroyed" << std::endl; }
-    RObj<T> get_return_object() {
-      return {.h_ = std::coroutine_handle<promise_type>::from_promise(*this)};
-    };
-    std::suspend_never initial_suspend() { return {}; }
-    std::suspend_always final_suspend() noexcept { return {}; }
-    void unhandled_exception() {}
-    std::suspend_always yield_value(T value) {
-      value_ = value;
-      return {};
+using namespace std;
+
+// Simulate an asynchronous operation, like reading data from a file
+std::future<std::string> async_read_data() {
+    return std::async(std::launch::async, [] {
+        // Simulate I/O delay
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+        return std::string("Data read from file");
+    });
+}
+
+// Awaiter for std::future to make it coroutine-compatible
+template <typename T>
+struct future_awaiter {
+    std::future<T> fut;
+
+    // Constructor accepts an rvalue reference to bind to a temporary
+    future_awaiter(std::future<T>&& fut) : fut(std::move(fut)) {}
+
+    bool await_ready() const noexcept { 
+        return fut.wait_for(std::chrono::seconds(0)) == std::future_status::ready; 
     }
-    void return_void() {}
-  };
-  std::coroutine_handle<promise_type> h_;
-  operator std::coroutine_handle<promise_type>() { return h_; }
-  operator std::coroutine_handle<>() const { return h_; }
+
+    void await_suspend(std::coroutine_handle<> handle) {
+        // Continue the coroutine when the future is ready
+        std::thread([this, handle]() {
+            fut.wait();  // Wait for the future to be ready
+            handle.resume();
+        }).detach();
+    }
+
+    T await_resume() {
+        return fut.get();  // Return the result of the future
+    }
 };
 
-RObj<int> coroutine() {
-  for (int i = 0; i < 3; ++i) {
-    co_yield i;
-  }
+// Coroutine that performs an async file read operation
+struct Task {
+    struct promise_type;
+    using handle_type = std::coroutine_handle<promise_type>;
+
+    struct promise_type {
+        Task get_return_object() {
+            return Task{handle_type::from_promise(*this)};
+        }
+
+        std::suspend_never initial_suspend() { return {}; }
+        std::suspend_always final_suspend() noexcept { return {}; }
+
+        void return_value(const std::string& value) { result = value; }
+        void unhandled_exception() { std::exit(1); }
+
+        std::string result;
+    };
+
+    handle_type coro_handle;
+    Task(handle_type h) : coro_handle(h) {}
+    ~Task() { coro_handle.destroy(); }
+
+    void resume() { coro_handle.resume(); }
+
+    std::string result() { return coro_handle.promise().result; }
+};
+
+// Coroutine that performs an async file read
+Task async_file_read() {
+    std::cout << "Starting asynchronous file read..." << std::endl;
+
+    // Perform an async operation, and co_await on it
+    std::string data = co_await future_awaiter<std::string>{std::move(async_read_data())};
+
+    std::cout << "File read complete: " << data << std::endl;
+    co_return data;
 }
 
-int main(int argc, char *argv[]) {
-  std::coroutine_handle<RObj<int>::promise_type> h = coroutine();
-  RObj<int>::promise_type &pp = h.promise();
-  while (!h.done()) {
-    std::cout << "Main loop " << pp.value_ << " h:" << &h << " times\n";
-    h();
-  }
+int main() {
+    Task task = async_file_read();  // Start the coroutine
 
-  return 0;
+    // Simulate doing other work while the coroutine runs asynchronously
+    std::cout << "Main thread doing other work..." << std::endl;
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+
+    task.resume();  // Resume the coroutine once the async operation is done
+
+    // Print the result of the coroutine once it's finished
+    std::cout << "Received from coroutine: " << task.result() << std::endl;
+
+    return 0;
 }
+
